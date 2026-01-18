@@ -1,3 +1,4 @@
+import re
 import os
 import time
 import argparse
@@ -90,13 +91,7 @@ def confidence(norm_name: str, cand_name: str, cas_no: str) -> float:
     return min(score, 1.0)
 
 
-def fetch_candidates(
-    session: requests.Session,
-    api_key: str,
-    query: str,
-    page_no: int = 1,
-    num_rows: int = 30,
-) -> Tuple[str, List[Dict]]:
+def fetch_candidates(session: requests.Session, api_key: str, query: str, page_no: int = 1, num_rows: int = 30) -> Tuple[str, List[Dict]]:
     params = {
         "serviceKey": api_key,
         "searchWrd": query,
@@ -104,13 +99,11 @@ def fetch_candidates(
         "pageNo": str(page_no),
         "numOfRows": str(num_rows),
     }
-
-   
-    r = session.get(KOSHA_CHEMLIST_URL, params=params, timeout=(5, 60))
+    r = session.get(KOSHA_CHEMLIST_URL, params=params, timeout=20)
     r.raise_for_status()
     xml_text = r.text
-    print("[DEBUG] query=", query, "items=", len(parse_chemlist(xml_text)), "head=", xml_text[:120])
     return xml_text, parse_chemlist(xml_text)
+
 
 
 def upsert_msds_candidates(
@@ -172,6 +165,111 @@ def pick_best(cands: List[Dict], norm_name: str) -> Optional[Dict]:
 
     return None
 
+def build_msds_queries(name: str) -> List[str]:
+    s = (name or "").strip()
+    if not s:
+        return []
+
+    synonym = {
+        "폴리에텔렌": "폴리에틸렌",
+        "레이욘": "레이온",
+        "레이욘스테이플면": "레이온스테이플면",
+        "산화티탄": "이산화티타늄", 
+        "티타늄디옥사이드": "이산화티타늄",
+        "티타늄디옥사이드(titanium dioxide)": "이산화티타늄",
+        "비닐에세테이트": "비닐 아세테이트",
+        "스티렌블록공중합체": "SBS",
+        "스틸렌부타디엔스티렌블록공중합체": "SBS",
+        "에틸렌프로필렌공중합체": "EPDM",
+        "올레핀중합체": "폴리올레핀",
+        "폴리아크릴산나트륨": "sodium polyacrylate",
+        "탄화소수지": "hydrocarbon resin",
+        "파라핀계탄화수소": "paraffin",
+        "피그먼트바이올렛23": "Pigment Violet 23",
+        "타르색소": "tar dye",
+        "카프릭트리글리세리드": "카프릴릭/카프릭 트리글리세라이드, caprylic/capric triglyceride, capric triglyceride",
+        "스테아르산아연": "스테아르산아연, 아연스테아레이트, zinc stearate",
+    }
+
+    # 성분명 뒤에 붙는 “형태/등급/코드” 제거용
+    suffix_patterns = [
+        r"(필름|부직포|시트|복합섬유|섬유|펄프|흡수지|흡수체|수지)$",
+        r"(필름|부직포|시트|복합섬유|섬유|펄프|흡수지|흡수체|수지)[a-z0-9\-_/]+$",
+        r"[a-z0-9]+$",  # 끝에 붙는 b, nb, w-pc 같은 코드 제거
+    ]
+
+    candidates = [s]
+
+    if s in synonym:
+        candidates.append(synonym[s])
+
+    cleaned = re.sub(r"[(){}\[\],;:·•\"'`~!@#$%^&*=+<>?/\\|]", " ", s)
+    cleaned = re.sub(r"\s+", " ", cleaned).strip()
+    if cleaned and cleaned != s:
+        candidates.append(cleaned)
+        if cleaned in synonym:
+            candidates.append(synonym[cleaned])
+
+    spaced = re.sub(r"([A-Za-z])([가-힣])", r"\1 \2", cleaned)
+    spaced = re.sub(r"([가-힣])([A-Za-z])", r"\1 \2", spaced)
+    spaced = re.sub(r"\s+", " ", spaced).strip()
+    if spaced and spaced != cleaned:
+        candidates.append(spaced)
+
+
+    def strip_suffix(x: str) -> str:
+        y = x
+        for pat in suffix_patterns:
+            y2 = re.sub(pat, "", y).strip()
+            if y2 != y:
+                y = y2
+        y = re.sub(r"\s+", " ", y).strip()
+        return y
+
+    for base in list(candidates):
+        stripped = strip_suffix(base)
+        if stripped and stripped != base:
+            candidates.append(stripped)
+ 
+            if stripped in synonym:
+                candidates.append(synonym[stripped])
+
+  
+    split_tokens = re.split(r"[\s\-/]+|복합|및|,|·", spaced)
+    split_tokens = [t.strip() for t in split_tokens if t.strip()]
+    for t in split_tokens:
+        t2 = strip_suffix(t)
+        if t2 and t2 != s:
+            candidates.append(t2)
+        if t2 in synonym:
+            candidates.append(synonym[t2])
+
+    # 중복 제거(순서 유지)
+    out = []
+    seen = set()
+    for q in candidates:
+        q = q.strip()
+        if not q:
+            continue
+        if q not in seen:
+            seen.add(q)
+            out.append(q)
+    return out[:12] 
+
+
+def fetch_candidates_with_fallback(session: requests.Session, api_key: str, norm_name: str) -> Tuple[str, List[Dict], str]:
+    """
+    returns: (xml_text, candidates, used_query)
+    """
+    queries = build_msds_queries(norm_name)
+    last_xml = ""
+    for q in queries:
+        xml_text, cands = fetch_candidates(session, api_key, q)
+        last_xml = xml_text
+        if len(cands) > 0:
+            return xml_text, cands, q
+    return last_xml, [], (queries[0] if queries else norm_name)
+
 
 def create_mapping(
     cur,
@@ -207,7 +305,9 @@ def main():
     ap.add_argument("--limit", type=int, default=50)
     ap.add_argument("--sleep", type=float, default=0.2)
     ap.add_argument("--force", action="store_true", help="이미 매핑된 성분도 재처리(주의)")
+    ap.add_argument("--only-no-candidate", action="store_true", help="no_candidate 상태인 성분만 재시도")
     args = ap.parse_args()
+
 
     api_key = must_env("KOSHA_MSDS_API_KEY")
     dsn = build_dsn()
@@ -224,31 +324,49 @@ def main():
     conn.autocommit = False
     try:
         with conn.cursor(cursor_factory=psycopg2.extras.DictCursor) as cur:
-            if args.force:
+            if args.only_no_candidate:
+                
                 cur.execute(
-                    """
-                    SELECT id, normalized_name
-                    FROM ingredient_normalized
-                    WHERE is_unknown = false
-                    ORDER BY id
-                    LIMIT %s
-                    """,
+                """
+                SELECT i.id, i.normalized_name
+                FROM ingredient_normalized i
+                JOIN ingredient_msds_mapping m
+                    ON m.ingredient_normalized_id = i.id
+                WHERE i.is_unknown = false
+                    AND m.match_status = 'no_candidate'
+                ORDER BY i.id
+                LIMIT %s
+                """,
                     (args.limit,),
+                )
+            elif args.force:
+               
+                cur.execute(
+                """
+                SELECT id, normalized_name
+                FROM ingredient_normalized
+                WHERE is_unknown = false
+                ORDER BY id
+                LIMIT %s
+                """,
+                (args.limit,),
                 )
             else:
+            # 아직 mapping이 없는 것만 처리(기존 동작)
                 cur.execute(
-                    """
-                    SELECT i.id, i.normalized_name
-                    FROM ingredient_normalized i
-                    LEFT JOIN ingredient_msds_mapping m
-                      ON m.ingredient_normalized_id = i.id
-                    WHERE i.is_unknown = false
-                      AND m.ingredient_normalized_id IS NULL
-                    ORDER BY i.id
-                    LIMIT %s
-                    """,
-                    (args.limit,),
+                """
+                SELECT i.id, i.normalized_name
+                FROM ingredient_normalized i
+                LEFT JOIN ingredient_msds_mapping m
+                    ON m.ingredient_normalized_id = i.id
+                WHERE i.is_unknown = false
+                    AND m.ingredient_normalized_id IS NULL
+                ORDER BY i.id
+                LIMIT %s
+                """,
+                (args.limit,),
                 )
+
 
             rows = cur.fetchall()
 
@@ -257,7 +375,7 @@ def main():
                 norm_name = str(r["normalized_name"])
 
                 try:
-                    xml_text, cands = fetch_candidates(session, api_key, norm_name)
+                    xml_text, cands, used_q = fetch_candidates_with_fallback(session, api_key, norm_name)
                 except requests.exceptions.RequestException as e:
                     # timeout/연결오류 등: 죽지 말고 상태만 기록 후 다음으로
                     print(f"[WARN] fetch failed: ingredient_id={ing_id} name={norm_name} err={e}")
@@ -273,10 +391,10 @@ def main():
                     time.sleep(args.sleep + random.uniform(0, 0.2))
                     continue
 
-                # 후보 저장(캐시)
+
                 upsert_msds_candidates(cur, ing_id, xml_text, cands, norm_name)
 
-                # 자동선택
+        
                 best = pick_best(cands, norm_name)
                 if not cands:
                     create_mapping(
