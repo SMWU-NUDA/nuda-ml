@@ -3,8 +3,8 @@ from typing import List, Optional
 import os
 import re
 
-from fastapi import APIRouter, HTTPException
-from pydantic import BaseModel, Field
+from fastapi import APIRouter, HTTPException, Path
+from pydantic import BaseModel
 from psycopg import connect
 from psycopg.rows import dict_row
 
@@ -20,73 +20,60 @@ def get_conn():
         row_factory=dict_row,
     )
 
-# ===== Request / Response =====
-
-class TrendSummaryReq(BaseModel):
-    productId: int = Field(..., ge=1)
-
-class TrendSummaryItem(BaseModel):
-    content: str
 
 class TrendSummaryRes(BaseModel):
     productId: int
     totalReviewCount: int
     trendHighlights: List[str]
-    analyzedAt: str
+    analyzedAt: Optional[str] = None
 
-# ===== Helpers =====
 
 _BULLET_PREFIX = re.compile(r"^\s*(?:[•\-\*]|(\d+)[\.\)])\s+")
+_SENT_SPLIT = re.compile(r"(?<=[.!?])\s+")
+_KO_EOS = ["습니다", "입니다", "합니다", "됩니다", "있습니다", "없습니다"]
 
-_PUNCT_SPLIT = re.compile(r"(?<=[\.\!\?])\s+")
-# 마침표가 없어도 "습니다/합니다/됩니다/있습니다..." 같은 종결에서 자르기
-_KO_EOS = re.compile(r"(습니다|입니다|합니다|됩니다|있습니다|없습니다)\s*")
+def _split_by_korean_eos(t: str) -> List[str]:
+    out: List[str] = []
+    buf = ""
+
+    i = 0
+    n = len(t)
+    while i < n:
+        buf += t[i]
+        for eos in _KO_EOS:
+            if buf.endswith(eos):
+                j = i + 1
+                if j < n and t[j] == ".":
+                    buf += "."
+                    i += 1
+                out.append(buf.strip())
+                buf = ""
+                break
+        i += 1
+
+    tail = buf.strip()
+    if tail:
+        out.append(tail)
+    return out
 
 def split_to_highlights(text: str, max_items: int = 3) -> List[str]:
     if not text:
         return []
-    t = " ".join(text.strip().split())  # 공백 정리
 
-    # 1) 문장부호 있으면 우선 사용
-    parts = [p.strip() for p in _PUNCT_SPLIT.split(t) if p.strip()]
-    if len(parts) >= 2:
-        return parts[:max_items]
+    t = " ".join(text.strip().split())
 
-    # 2) 한국어 종결어미 기반으로 자르기 (마침표 없어도)
-    cuts = [m.end() for m in _KO_EOS.finditer(t)]
-    if cuts:
-        out = []
-        start = 0
-        for end in cuts:
-            seg = t[start:end].strip()
-            if seg:
-                out.append(seg)
-            start = end
-            if len(out) >= max_items:
-                break
-        if len(out) < max_items:
-            tail = t[start:].strip()
-            if tail:
-                out.append(tail)
-        # 너무 짧은 조각 제거
-        out = [s for s in out if len(s) >= 8]
-        return out[:max_items] if out else [t]
+    parts = [p.strip() for p in _SENT_SPLIT.split(t) if p.strip()]
 
-    # 3) fallback: 그냥 1개
-    return [t]
+    if len(parts) <= 1:
+        parts = [p.strip() for p in _split_by_korean_eos(t) if p.strip()]
+
+    parts = [p for p in parts if len(p) >= 6]
+
+    return parts[:max_items] if parts else [t]
 
 def split_summary_to_bullets(summary: str) -> List[str]:
-    """
-    summary 텍스트가
-    - "• 문장\n• 문장"
-    - "- 문장\n- 문장"
-    - "1. 문장\n2. 문장"
-    - 그냥 여러 줄
-    같은 형태일 수 있어서 최대한 안전하게 줄 단위로 bullets 추출
-    """
     if not summary:
         return []
-
     lines = [ln.strip() for ln in summary.splitlines() if ln.strip()]
     if not lines:
         return []
@@ -97,20 +84,25 @@ def split_summary_to_bullets(summary: str) -> List[str]:
         if ln2:
             bullets.append(ln2)
 
-    # 만약 줄 분리가 안 먹고 한 줄에 "•"가 여러 개면 추가 분해
     if len(bullets) == 1 and "•" in bullets[0]:
         parts = [p.strip() for p in bullets[0].split("•") if p.strip()]
         if len(parts) >= 2:
             bullets = parts
 
+    if len(bullets) == 1:
+        bullets = split_to_highlights(bullets[0], max_items=3)
+
     return bullets
 
-# ===== Endpoint =====
 
-@router.post("/{product_id}/review-trend", response_model=TrendSummaryRes
-             ,summary="상품별 리뷰 트렌드 요약 API",
-             description="상품별로 최신 리뷰 요약과 총 리뷰수를 반환합니다.\n\n")
-def get_trend_summary(req: TrendSummaryReq):
+@router.get(
+    "/{product_id}/review-trend",
+    response_model=TrendSummaryRes,
+    summary="상품별 리뷰 트렌드 요약 API",
+)
+def get_trend_summary(
+    product_id: int = Path(..., ge=1, description="상품 ID")
+):
     sql = """
     WITH rs AS (
       SELECT
@@ -142,23 +134,20 @@ def get_trend_summary(req: TrendSummaryReq):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(sql, {"product_id": req.productId})
+                cur.execute(sql, {"product_id": product_id})
                 row = cur.fetchone()
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
     if not row:
         raise HTTPException(status_code=404, detail="trend summary not found")
+    
+    bullets = split_summary_to_bullets(row["summary"] or "")
+    items = bullets[:3] if bullets else split_to_highlights(row["summary"] or "", max_items=3)
 
-    items = split_to_highlights(row["summary"] or "", max_items=3)
-    trend_items = [{"content": s} for s in items]
-
-
-
-    items = split_to_highlights(row["summary"] or "", max_items=3)
     return {
         "productId": row["product_id"],
         "totalReviewCount": row["total_review_count"],
         "trendHighlights": items,
-        "analyzedAt": row["updated_at"].isoformat() if row["updated_at"] else None, 
-        }
+        "analyzedAt": row["updated_at"].isoformat() if row["updated_at"] else None,
+    }

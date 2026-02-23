@@ -16,9 +16,6 @@ from psycopg.rows import dict_row
 
 router = APIRouter(prefix="/ml/products", tags=["reviews"])
 
-# =======================
-# DB
-# =======================
 def get_conn():
     return psycopg.connect(
         host=os.getenv("DB_HOST"),
@@ -46,9 +43,6 @@ def _coerce_json(v: Any) -> Any:
             return None
     return None
 
-# =======================
-# Keyword cleaning
-# =======================
 STOPWORDS = {
     "제품","구매","재구매","사용","쓰고","써봤","써봄","구매했","구매했는데",
     "괜찮","괜찮음","괜찮아요","좋아","좋음","좋아요","좋다","만족","추천",
@@ -69,14 +63,12 @@ def normalize_kw(s: str) -> str:
     s = unicodedata.normalize("NFKC", s).strip()
     s = re.sub(r"\s+", " ", s)
 
-    # 한글/공백만 남기기
     s = re.sub(r"[^가-힣\s]", " ", s)
     s = re.sub(r"\s+", " ", s).strip()
 
     if len(s) <= 1 or len(s) >= 25:
         return ""
 
-    # suffix strip 최대 2회
     for _ in range(2):
         changed = False
         for suf in SUFFIXES:
@@ -92,16 +84,12 @@ def normalize_kw(s: str) -> str:
     if s in STOPWORDS:
         return ""
 
-    # 너무 문장형인 것 약 컷
     bad_contains = ["해보겠", "혜택", "구매해", "구입해", "듭니", "사용하"]
     if any(b in s for b in bad_contains):
         return ""
 
     return s
 
-# =======================
-# Positive: feature_scores -> topn keywords (score 기반)
-# =======================
 def pack_feature_scores(feature_scores: Dict[str, Dict[str, float]], topn: int = 5) -> List[Dict[str, str]]:
     candidates: Dict[str, float] = {}
 
@@ -123,12 +111,9 @@ def pack_feature_scores(feature_scores: Dict[str, Dict[str, float]], topn: int =
         return []
 
     items = list(candidates.items())
-    items.sort(key=lambda t: (-t[1], len(t[0]), t[0]))  # score desc
+    items.sort(key=lambda t: (-t[1], len(t[0]), t[0]))  
     return [{"keyword": k} for k, _ in items[:topn]]
 
-# =======================
-# Positive beautify (짧은 자연어)
-# =======================
 POSITIVE_PATTERNS = [
     # 민감/자극
     (["트러블"], "트러블이 나지 않음"),
@@ -169,7 +154,7 @@ def beautify_positive(keyword: str) -> str:
     for keys, label in POSITIVE_PATTERNS:
         if any(k in keyword for k in keys):
             return label
-    return keyword  # fallback: 원문 그대로
+    return keyword 
 
 def beautify_positive_list(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
     out: List[Dict[str, str]] = []
@@ -180,9 +165,6 @@ def beautify_positive_list(items: List[Dict[str, str]]) -> List[Dict[str, str]]:
         out.append({"keyword": beautify_positive(k)})
     return out
 
-# =======================
-# Negative: ai_review_summary.summary -> short labels
-# =======================
 NEG_SHORT_PATTERNS = [
     (["답답"], "답답함"),
     (["덥"], "더움"),
@@ -213,7 +195,6 @@ def ai_summary_to_short_negatives(summary: str, topn: int = 5) -> List[Dict[str,
         if any(k in summary for k in keys):
             found.append(label)
 
-    # 중복 제거 + topn
     uniq: List[Dict[str, str]] = []
     seen = set()
     for x in found:
@@ -226,9 +207,6 @@ def ai_summary_to_short_negatives(summary: str, topn: int = 5) -> List[Dict[str,
 
     return uniq
 
-# =======================
-# Schemas
-# =======================
 class KeywordItem(BaseModel):
     keyword: str
 
@@ -239,9 +217,6 @@ class ReviewSummaryRes(BaseModel):
     totalCount: int
     analyzedAt: Optional[datetime] = None
 
-# =======================
-# SQL
-# =======================
 SUMMARY_SQL = """
 SELECT
   product_id,
@@ -271,9 +246,6 @@ ORDER BY updated_at DESC
 LIMIT 1
 """
 
-# =======================
-# Route
-# =======================
 @router.get(
     "/{product_id}/review-keywords",
     response_model=ReviewSummaryRes,
@@ -299,12 +271,10 @@ def get_review_summary(product_id: int, topn: int = 5):
         if not srow and not frow and not arow:
             raise HTTPException(status_code=404, detail="summary not found")
 
-        # totalCount
         total_count = 0
         if srow:
             total_count = int(srow.get("pos_keyword_num") or 0) + int(srow.get("neg_keyword_num") or 0)
 
-        # positive
         positive: List[Dict[str, str]] = []
         if frow:
             fs = _coerce_json(frow.get("feature_scores"))
@@ -312,7 +282,6 @@ def get_review_summary(product_id: int, topn: int = 5):
                 positive = pack_feature_scores(fs, topn=topn)
         positive = beautify_positive_list(positive)
 
-        # negative (ai summary -> short labels)
         negative: List[Dict[str, str]] = []
         analyzed_at: Optional[datetime] = None
         if arow and arow.get("summary"):
