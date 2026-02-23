@@ -1,5 +1,6 @@
 import os
 import psycopg2
+import psycopg2.extras
 from dotenv import load_dotenv
 
 load_dotenv()
@@ -17,4 +18,4 @@ def build_dsn() -> str:
     )
 
 def get_conn():
-    return psycopg2.connect(build_dsn())
+    return psycopg2.connect(build_dsn(), cursor_factory=psycopg2.extras.RealDictCursor)

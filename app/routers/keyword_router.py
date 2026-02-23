@@ -1,8 +1,8 @@
-from typing import List, Optional, Literal
+from typing import List, Literal
 import os
 from datetime import datetime, timezone
 
-from fastapi import APIRouter, HTTPException
+from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
 from psycopg import connect
 from psycopg.rows import dict_row
@@ -19,26 +19,15 @@ def get_conn():
         row_factory=dict_row,
     )
 
-Keyword = Literal["irritationLevel", "scent", "adhesion", "absorption", "all"]
+Keyword = Literal["irritationLevel", "scent", "adhesion", "absorption", "default"]
 
-class GlobalScoreReq(BaseModel):
-    keyword: Optional[Keyword] = Field(default="all")
-    limit: int = Field(default=50, ge=1, le=200)
-
-
-class ProductRank(BaseModel):
-    productId: int
-    score: float
-
-
-class GlobalScoreRes(BaseModel):
-    rankingBasis: Optional[str]
-    products: List[ProductRank]
-    analyzedAt: datetime
+class GlobalRankRes(BaseModel):
+    keyword: Keyword
+    rankedIds: List[int] 
 
 
 def build_score_sql(basis: Keyword) -> str:
-    if basis == "all":
+    if basis == "default":
         return """
         (COALESCE(v.sensitivity_sum,0)
        + COALESCE(v.scent_sum,0)
@@ -56,41 +45,30 @@ def build_score_sql(basis: Keyword) -> str:
     raise HTTPException(status_code=400, detail=f"unsupported keyword: {basis}")
 
 
-@router.post(
+@router.get(
     "/global-score",
-    response_model=GlobalScoreRes,
+    response_model=GlobalRankRes,
     summary="모든 사용자 대상 키워드 기반 상품추천 API",
 )
-def global_score(req: GlobalScoreReq):
-
-    basis = req.keyword or "all"
-    score_sql = build_score_sql(basis)
-    ranking_basis_out = None if basis == "all" else basis
+def global_score(
+    keyword: Keyword = Query(default="default", description="default | irritationLevel | scent | adhesion | absorption"),
+    topK: int = Query(default=30, ge=1, le=500),
+):
+    score_sql = build_score_sql(keyword)
 
     with get_conn() as conn:
         with conn.cursor() as cur:
-
             sql = f"""
             SELECT
-              p.id AS product_id,
-              ({score_sql})::double precision AS score
+              p.id AS product_id
             FROM v_product_feature_sum v
             JOIN product p
               ON p.external_product_id = v.external_product_id
-            ORDER BY score DESC
+            ORDER BY ({score_sql})::double precision DESC
             LIMIT %s
             """
-
-            cur.execute(sql, (req.limit,))
+            cur.execute(sql, (topK,))
             rows = cur.fetchall()
 
-    return GlobalScoreRes(
-        rankingBasis=ranking_basis_out,
-        products=[
-            ProductRank(
-                productId=r["product_id"],
-                score=float(r["score"])
-            ) for r in rows
-        ],
-        analyzedAt=datetime.now(timezone.utc),
-    )
+    ranked_ids = [int(r["product_id"]) for r in rows]
+    return GlobalRankRes(keyword=keyword, rankedIds=ranked_ids)
