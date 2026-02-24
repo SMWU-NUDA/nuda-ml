@@ -173,3 +173,127 @@ def personalized_rank(
     )
 
     return {"keyword": keyword, "rankedIds": ranked_ids}
+
+from typing import Literal, List, Optional
+from pydantic import BaseModel, Field
+
+# ... (기존 코드 그대로)
+
+class PersonalizedRankItemDebug(BaseModel):
+    productId: int
+    modelScore: float = 0.0
+    filterScore: float = 0.0
+    finalScore: float = 0.0
+    dSensitivity: Optional[float] = None
+    dScent: Optional[float] = None
+    dAbsorbency: Optional[float] = None
+    dAdhesion: Optional[float] = None
+
+class PersonalizedRankDebugRes(BaseModel):
+    keyword: Keyword
+    topK: int
+    results: List[PersonalizedRankItemDebug]
+
+
+@router.get(
+    "/personalized-rank/debug",
+    response_model=PersonalizedRankDebugRes,
+    summary="(디버그) 키워드별 맞춤 상품 랭킹 조회 - score 포함",
+)
+def personalized_rank_debug(
+    memberId: int = Query(..., description="member.id"),
+    keyword: Keyword = Query(default="default", description="default | irritationLevel | scent | absorption | adhesion"),
+    topK: int = Query(default=TOPK_DEFAULT, ge=1, le=500),
+):
+    member_id = int(memberId)
+    limit_n = int(CANDIDATES_PER_CAT)
+
+    try:
+        conn = get_conn()
+        try:
+            with conn.cursor() as cur:
+                cur.execute(PREF_SQL, (member_id,))
+                pref = cur.fetchone()
+                cols = [d[0] for d in cur.description]
+
+            if not pref:
+                return {"keyword": keyword, "topK": topK, "results": []}
+
+            pref_dict = pref if isinstance(pref, dict) else dict(zip(cols, pref))
+
+            q_emb = pref_to_query_vec(pref_dict)
+            q_emb_str = "[" + ",".join(str(x) for x in q_emb) + "]"
+
+            with conn.cursor() as cur:
+                cur.execute(EMB_CANDIDATE_IDS_SQL, (q_emb_str, limit_n))
+                id_rows = cur.fetchall()
+
+            product_ids: List[int] = []
+            for r in id_rows:
+                product_ids.append(r["product_id"] if isinstance(r, dict) else r[0])
+
+            if not product_ids:
+                return {"keyword": keyword, "topK": topK, "results": []}
+
+            with conn.cursor() as cur:
+                cur.execute(CANDIDATE_BY_IDS_SQL, (member_id, list(product_ids)))
+                columns = [d[0] for d in cur.description]
+                rows = cur.fetchall()
+
+            df = pd.DataFrame(rows, columns=columns)
+
+        finally:
+            conn.close()
+
+    except Exception:
+        import traceback
+        raise HTTPException(status_code=500, detail=f"DB error: {traceback.format_exc()}")
+
+    if df.empty:
+        return {"keyword": keyword, "topK": topK, "results": []}
+
+    try:
+        FEATS = model.feature_names
+        for c in FEATS:
+            df[c] = pd.to_numeric(df[c], errors="coerce")
+        df[FEATS] = df[FEATS].fillna(0)
+        df["model_score"] = model.score(df)
+    except Exception:
+        import traceback
+        raise HTTPException(status_code=500, detail=traceback.format_exc())
+
+    df = apply_filter_rerank(df, keyword)
+
+    if "filter_score" not in df.columns:
+        df["filter_score"] = 0.0
+        
+    df2 = (
+        df.sort_values("final_score", ascending=False)
+          .head(topK)
+          .copy()
+    )
+
+    def _get_float(row, key) -> Optional[float]:
+        if key not in row or pd.isna(row[key]):
+            return None
+        try:
+            return float(row[key])
+        except Exception:
+            return None
+
+    results: List[PersonalizedRankItemDebug] = []
+    for _, row in df2.iterrows():
+        results.append(
+            PersonalizedRankItemDebug(
+                productId=int(row["product_id"]),
+                modelScore=float(row.get("model_score", 0.0) or 0.0),
+                filterScore=float(row.get("filter_score", 0.0) or 0.0),
+                finalScore=float(row.get("final_score", 0.0) or 0.0),
+                dSensitivity=_get_float(row, "d_sensitivity"),
+                dScent=_get_float(row, "d_scent"),
+                dAbsorbency=_get_float(row, "d_absorbency"),
+                dAdhesion=_get_float(row, "d_adhesion"),
+            )
+        )
+
+    return PersonalizedRankDebugRes(keyword=keyword, topK=topK, results=results)

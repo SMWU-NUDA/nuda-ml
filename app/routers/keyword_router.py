@@ -1,6 +1,5 @@
-from typing import List, Literal
+from typing import List, Literal, Optional
 import os
-from datetime import datetime, timezone
 
 from fastapi import APIRouter, HTTPException, Query
 from pydantic import BaseModel, Field
@@ -23,8 +22,7 @@ Keyword = Literal["irritationLevel", "scent", "adhesion", "absorption", "default
 
 class GlobalRankRes(BaseModel):
     keyword: Keyword
-    rankedIds: List[int] 
-
+    rankedIds: List[int]
 
 def build_score_sql(basis: Keyword) -> str:
     if basis == "default":
@@ -43,7 +41,6 @@ def build_score_sql(basis: Keyword) -> str:
     if basis == "absorption":
         return "COALESCE(v.absorbency_sum,0)"
     raise HTTPException(status_code=400, detail=f"unsupported keyword: {basis}")
-
 
 @router.get(
     "/global-score",
@@ -72,3 +69,48 @@ def global_score(
 
     ranked_ids = [int(r["product_id"]) for r in rows]
     return GlobalRankRes(keyword=keyword, rankedIds=ranked_ids)
+
+class GlobalRankItemDebug(BaseModel):
+    productId: int
+    score: float
+
+class GlobalRankDebugRes(BaseModel):
+    keyword: Keyword
+    topK: int
+    results: List[GlobalRankItemDebug]
+
+@router.get(
+    "/global-score/debug",
+    response_model=GlobalRankDebugRes,
+    summary="(디버그) 키워드 기반 상품추천 - score 포함",
+)
+def global_score_debug(
+    keyword: Keyword = Query(default="default", description="default | irritationLevel | scent | adhesion | absorption"),
+    topK: int = Query(default=30, ge=1, le=500),
+):
+    score_sql = build_score_sql(keyword)
+
+    with get_conn() as conn:
+        with conn.cursor() as cur:
+            sql = f"""
+            SELECT
+              p.id AS product_id,
+              ({score_sql})::double precision AS score
+            FROM v_product_feature_sum v
+            JOIN product p
+              ON p.external_product_id = v.external_product_id
+            ORDER BY score DESC
+            LIMIT %s
+            """
+            cur.execute(sql, (topK,))
+            rows = cur.fetchall()
+
+    results = [
+        GlobalRankItemDebug(
+            productId=int(r["product_id"]),
+            score=float(r["score"] or 0.0),
+        )
+        for r in rows
+    ]
+
+    return GlobalRankDebugRes(keyword=keyword, topK=topK, results=results)
