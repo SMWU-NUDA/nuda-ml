@@ -177,7 +177,6 @@ def personalized_rank(
 from typing import Literal, List, Optional
 from pydantic import BaseModel, Field
 
-# ... (기존 코드 그대로)
 
 class PersonalizedRankItemDebug(BaseModel):
     productId: int
@@ -266,7 +265,7 @@ def personalized_rank_debug(
 
     if "filter_score" not in df.columns:
         df["filter_score"] = 0.0
-        
+
     df2 = (
         df.sort_values("final_score", ascending=False)
           .head(topK)
