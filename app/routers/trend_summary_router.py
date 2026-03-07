@@ -95,6 +95,11 @@ def split_summary_to_bullets(summary: str) -> List[str]:
     return bullets
 
 
+REVIEW_COUNT_SQL = """
+SELECT review_count FROM public.product WHERE id = %(product_id)s LIMIT 1
+"""
+
+
 @router.get(
     "/{product_id}/review-trend",
     response_model=TrendSummaryRes,
@@ -103,45 +108,53 @@ def split_summary_to_bullets(summary: str) -> List[str]:
 def get_trend_summary(
     product_id: int = Path(..., ge=1, description="상품 ID")
 ):
-    sql = """
-    WITH rs AS (
-      SELECT
-        s.product_id,
-        s.summary,
-        s.updated_at
-      FROM ai_review_summary s
-      WHERE s.product_id = %(product_id)s
-      ORDER BY s.updated_at DESC
-      LIMIT 1
-    ),
-    rc AS (
-      SELECT
-        r.product_id,
-        COUNT(*)::int AS total_review_count
-      FROM review r
-      WHERE r.product_id = %(product_id)s
-      GROUP BY r.product_id
-    )
-    SELECT
-      rs.product_id,
-      COALESCE(rc.total_review_count, 0) AS total_review_count,
-      rs.summary,
-      rs.updated_at
-    FROM rs
-    LEFT JOIN rc ON rc.product_id = rs.product_id;
-    """
-
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 리뷰 수 체크
+                cur.execute(REVIEW_COUNT_SQL, {"product_id": product_id})
+                prow = cur.fetchone()
+                if prow is not None and int(prow.get("review_count") or 0) < 10:
+                    raise HTTPException(status_code=422, detail="리뷰수가 10개 이하입니다.")
+
+                sql = """
+                WITH rs AS (
+                  SELECT
+                    s.product_id,
+                    s.summary,
+                    s.updated_at
+                  FROM ai_review_summary s
+                  WHERE s.product_id = %(product_id)s
+                  ORDER BY s.updated_at DESC
+                  LIMIT 1
+                ),
+                rc AS (
+                  SELECT
+                    r.product_id,
+                    COUNT(*)::int AS total_review_count
+                  FROM review r
+                  WHERE r.product_id = %(product_id)s
+                  GROUP BY r.product_id
+                )
+                SELECT
+                  rs.product_id,
+                  COALESCE(rc.total_review_count, 0) AS total_review_count,
+                  rs.summary,
+                  rs.updated_at
+                FROM rs
+                LEFT JOIN rc ON rc.product_id = rs.product_id;
+                """
                 cur.execute(sql, {"product_id": product_id})
                 row = cur.fetchone()
+
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=f"DB error: {e}")
 
     if not row:
         raise HTTPException(status_code=404, detail="trend summary not found")
-    
+
     bullets = split_summary_to_bullets(row["summary"] or "")
     items = bullets[:3] if bullets else split_to_highlights(row["summary"] or "", max_items=3)
 

@@ -217,6 +217,10 @@ class ReviewSummaryRes(BaseModel):
     totalCount: int
     analyzedAt: Optional[datetime] = None
 
+REVIEW_COUNT_SQL = """
+SELECT review_count FROM public.product WHERE id = %(product_id)s LIMIT 1
+"""
+
 SUMMARY_SQL = """
 SELECT
   product_id,
@@ -259,6 +263,12 @@ def get_review_summary(product_id: int, topn: int = 5):
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
+                # 리뷰 수 체크
+                cur.execute(REVIEW_COUNT_SQL, {"product_id": product_id})
+                prow = cur.fetchone()
+                if prow is not None and int(prow.get("review_count") or 0) < 10:
+                    raise HTTPException(status_code=422, detail="리뷰수가 10개 이하입니다.")
+
                 cur.execute(SUMMARY_SQL, {"product_id": product_id})
                 srow = cur.fetchone()
 
