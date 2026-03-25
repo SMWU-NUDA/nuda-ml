@@ -1,5 +1,5 @@
 from datetime import datetime
-from typing import Literal, Optional, Dict, Any
+from typing import Literal
 
 import os
 import psycopg
@@ -7,7 +7,7 @@ from psycopg.rows import dict_row
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel, Field
 
-router = APIRouter(tags=["update"])
+router = APIRouter(tags=["keyword"])
 
 def get_conn():
     return psycopg.connect(
@@ -21,14 +21,15 @@ def get_conn():
     )
 
 IrritationLevel = Literal["NONE", "SOMETIMES", "OFTEN"]
-ScentLevel      = Literal["NONE", "MILD", "STRONG"]
-Level3          = Literal["LOW", "MEDIUM", "HIGH"]
+ScentLevel = Literal["NONE", "MILD", "STRONG"]
+Level3 = Literal["LOW", "MEDIUM", "HIGH"]
 
-class PrefUpsertRequest(BaseModel):
+class KeywordUpsertRequest(BaseModel):
     memberId: int = Field(..., ge=1)
     irritationLevel: IrritationLevel
     scent: ScentLevel
-    absorption: Level3
+    changeFrequency: Level3
+    thickness: Level3
     adhesion: Level3
 
 class PrefSaved(BaseModel):
@@ -37,12 +38,43 @@ class PrefSaved(BaseModel):
     pAbsorbencyLevel: int
     pAdhesionLevel: int
 
-class PrefUpsertResponse(BaseModel):
+class KeywordUpsertResponse(BaseModel):
     memberId: int
     saved: PrefSaved
     asOf: datetime
 
-UPSERT_SQL = """
+KEYWORD_UPSERT_SQL = """
+INSERT INTO keyword (
+    member_id,
+    irritation_level,
+    scent,
+    change_frequency,
+    thickness,
+    adhesion,
+    created_at,
+    updated_at
+)
+VALUES (
+    %(member_id)s,
+    %(irritation_level)s,
+    %(scent)s,
+    %(change_frequency)s,
+    %(thickness)s,
+    %(adhesion)s,
+    NOW(),
+    NOW()
+)
+ON CONFLICT (member_id)
+DO UPDATE SET
+    irritation_level = EXCLUDED.irritation_level,
+    scent = EXCLUDED.scent,
+    change_frequency = EXCLUDED.change_frequency,
+    thickness = EXCLUDED.thickness,
+    adhesion = EXCLUDED.adhesion,
+    updated_at = NOW();
+"""
+
+PREF_UPSERT_SQL = """
 INSERT INTO rec_member_pref (
     member_id,
     p_sensitivity_level,
@@ -55,7 +87,7 @@ INSERT INTO rec_member_pref (
 VALUES (
     %(member_id)s,
 
-    CASE %(irritationLevel)s
+    CASE %(irritation_level)s
         WHEN 'NONE' THEN 1
         WHEN 'SOMETIMES' THEN 3
         WHEN 'OFTEN' THEN 5
@@ -69,7 +101,7 @@ VALUES (
         ELSE 3
     END,
 
-    CASE %(absorption)s
+    CASE %(change_frequency)s
         WHEN 'LOW' THEN 1
         WHEN 'MEDIUM' THEN 3
         WHEN 'HIGH' THEN 5
@@ -84,8 +116,10 @@ VALUES (
     END,
 
     COALESCE(
-      (SELECT p_safety_level FROM rec_member_pref WHERE member_id = %(member_id)s),
-      3
+        (SELECT p_safety_level
+         FROM rec_member_pref
+         WHERE member_id = %(member_id)s),
+        3
     ),
 
     NOW()
@@ -93,10 +127,10 @@ VALUES (
 ON CONFLICT (member_id)
 DO UPDATE SET
     p_sensitivity_level = EXCLUDED.p_sensitivity_level,
-    p_scent_level       = EXCLUDED.p_scent_level,
-    p_absorbency_level  = EXCLUDED.p_absorbency_level,
-    p_adhesion_level    = EXCLUDED.p_adhesion_level,
-    as_of               = NOW()
+    p_scent_level = EXCLUDED.p_scent_level,
+    p_absorbency_level = EXCLUDED.p_absorbency_level,
+    p_adhesion_level = EXCLUDED.p_adhesion_level,
+    as_of = NOW()
 RETURNING
     member_id,
     p_sensitivity_level,
@@ -107,24 +141,43 @@ RETURNING
     as_of;
 """
 
-@router.post("/members/{memberId}/preference/keyword-update", response_model=PrefUpsertResponse,
-             summary="키워드 자동 업데이트 API", description="회원 키워드 업데이트시 점수로 변환해서 자동 저장")
-def upsert_member_pref(req: PrefUpsertRequest):
+@router.post(
+    "/members/{memberId}/keyword",
+    response_model=KeywordUpsertResponse,
+    summary="키워드 저장 및 업데이트 API",
+    description="keyword 저장 시 score로 변환하여 저장"
+)
+def upsert_keyword(memberId: int, req: KeywordUpsertRequest):
+    if memberId != req.memberId:
+        raise HTTPException(
+            status_code=400,
+            detail="Path memberId and body memberId do not match"
+        )
+
     params = {
         "member_id": req.memberId,
-        "irritationLevel": req.irritationLevel,
+        "irritation_level": req.irritationLevel,
         "scent": req.scent,
-        "absorption": req.absorption,
+        "change_frequency": req.changeFrequency,
+        "thickness": req.thickness,
         "adhesion": req.adhesion,
     }
 
     try:
         with get_conn() as conn:
             with conn.cursor() as cur:
-                cur.execute(UPSERT_SQL, params)
+                cur.execute(KEYWORD_UPSERT_SQL, params)
+
+                cur.execute(PREF_UPSERT_SQL, params)
                 row = cur.fetchone()
+
                 if not row:
-                    raise HTTPException(status_code=500, detail="Upsert succeeded but no row returned")
+                    raise HTTPException(
+                        status_code=500,
+                        detail="Preference upsert succeeded but no row returned"
+                    )
+
+            conn.commit()
 
         return {
             "memberId": row["member_id"],
@@ -138,4 +191,7 @@ def upsert_member_pref(req: PrefUpsertRequest):
         }
 
     except psycopg.Error as e:
-        raise HTTPException(status_code=500, detail=f"DB error: {e.pgerror or str(e)}")
+        raise HTTPException(
+            status_code=500,
+            detail=f"DB error: {e.pgerror or str(e)}"
+        )
